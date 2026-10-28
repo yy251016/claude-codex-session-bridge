@@ -1109,7 +1109,9 @@ def _suggest_local_files(cwd, query, limit=15):
 
 
 def cmd_suggest(args):
-    """供 Claude Code fileSuggestion 与 MCP completion/complete 调用的毫秒级 @ 模糊补全。"""
+    """供 Claude Code fileSuggestion 与 MCP completion/complete 调用的毫秒级 @ 模糊补全。
+    优先确保在 Claude Code 中一敲 @ 或输入关键词时，跨端历史会话立即排在下拉列表最顶端。
+    """
     query = args.query
     cwd = os.getcwd()
 
@@ -1140,36 +1142,48 @@ def cmd_suggest(args):
         print(json.dumps(items, ensure_ascii=False))
         return
 
-    # 1. 输入了 @codex标题 / @codex：标题 / @codex 标题 / @codex:标题（无需冒号直接连打中文或任意分隔符均可）
-    m = re.match(r"^(codex|claude)([\s:：/\-_]*)(.*)$", q, flags=re.IGNORECASE)
-    if m:
-        ag = m.group(1).lower()
-        raw_sep = m.group(2) or ""
-        sep = ":" if ":" in raw_sep else ("/" if "/" in raw_sep else ("-" if "-" in raw_sep else ""))
-        kw = (m.group(3) or "").strip()
-        for item in _suggest_sessions_for_agent(ag, kw, limit=args.limit, include_prefix=True, sep=sep):
+    out = []
+
+    # 1. 刚按 @ (query 为空)：最高优先级列出目标 Agent 及其最近活跃会话，再跟本地文件
+    if not q:
+        out.append(f"{other_agent}:")
+        sess = _suggest_sessions_for_agent(other_agent, "", limit=8, include_prefix=True, sep=":")
+        out.extend(sess)
+        files = _suggest_local_files(cwd, "", limit=max(5, args.limit - len(out)))
+        out.extend(files)
+        for item in out[: args.limit]:
             print(item)
         return
 
-    # 2. 正在输入前缀（如 @c / @co / @cod / @code）
+    # 2. 显式以 codex 或 claude 开头（如 @c / @codex / @codex:店发 / @codex 店发）
+    m = re.match(r"^(codex|claude)([\s:：/\-_]*)(.*)$", q, flags=re.IGNORECASE)
+    if m:
+        ag = m.group(1).lower()
+        kw = (m.group(3) or "").strip()
+        sess = _suggest_sessions_for_agent(ag, kw, limit=args.limit, include_prefix=True, sep=":")
+        for item in sess[: args.limit]:
+            print(item)
+        return
+
+    # 3. 正在打字匹配 agent 名称前缀（如 'c', 'co'）
     q_low = q.lower()
-    out = []
-    if q_low and other_agent.startswith(q_low):
-        out.append(other_agent)
-        out.extend(_suggest_sessions_for_agent(other_agent, "", limit=5, include_prefix=True, sep=""))
+    if other_agent.startswith(q_low):
+        out.append(f"{other_agent}:")
+        sess = _suggest_sessions_for_agent(other_agent, "", limit=6, include_prefix=True, sep=":")
+        out.extend(sess)
 
-    # 3. 常规文件补全 + 跨端会话标题模糊命中补充
-    files = _suggest_local_files(cwd, q, limit=max(5, args.limit - len(out)))
-    out.extend(files)
+    # 4. 直接搜中英文关键词（如 @店发 / @订单 / @需求）：优先排出会话命中项
+    sess_hits = _suggest_sessions_for_agent(other_agent, q, limit=6, include_prefix=True, sep=":")
+    for sh in sess_hits:
+        if sh not in out:
+            out.append(sh)
 
-    if not q:
-        out.append(other_agent)
-        out.extend(_suggest_sessions_for_agent(other_agent, "", limit=5, include_prefix=True, sep=""))
-    elif len(q) >= 2:
-        sess_hits = _suggest_sessions_for_agent(other_agent, q, limit=5, include_prefix=True, sep="")
-        for sh in sess_hits:
-            if sh not in out:
-                out.append(sh)
+    # 5. 最后补充匹配的本地文件
+    rem = max(3, args.limit - len(out))
+    files = _suggest_local_files(cwd, q, limit=rem)
+    for f in files:
+        if f not in out:
+            out.append(f)
 
     for item in out[: args.limit]:
         print(item)
