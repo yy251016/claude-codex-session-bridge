@@ -152,7 +152,7 @@ async function handleRequest(msg) {
           const safeTitle = it.title.replace(/[\r\n]+/g, " ").trim();
           return {
             uri: `session://${it.agent}/${it.id}`,
-            name: `[${tag}] ${safeTitle}`,
+            name: `${it.agent} ${safeTitle}`,
             description: `${tag} 会话 (${it.updated_at}) | cwd: ${it.cwd || "-"} | ID: ${it.id}`,
             mimeType: "text/markdown",
           };

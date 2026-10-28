@@ -581,11 +581,11 @@ def find_rollout_for(row):
 
 
 def _parse_agent_prefix(key, default_agent="all"):
-    """支持 @codex:xxx / @claude:xxx / codex:xxx / claude:xxx / @xxx。"""
+    """支持 @codex 标题 / @claude 标题 / @codex:标题 / @claude:标题 / codex:标题 / claude:标题。"""
     s = (key or "").strip()
     if s.startswith("@"):
         s = s[1:].strip()
-    m = re.match(r"^(codex|claude)\s*[:：/]\s*(.+)$", s, flags=re.IGNORECASE)
+    m = re.match(r"^(codex|claude)(?:\s*[:：/]\s*|\s+)(.+)$", s, flags=re.IGNORECASE)
     if m:
         return m.group(2).strip().strip('"\'「」【】《》'), m.group(1).lower()
     return s.strip('"\'「」【】《》'), default_agent
@@ -819,56 +819,58 @@ def cmd_list_json(args):
 
 
 def extract_session_mentions_from_prompt(prompt_text, current_agent="claude", cwd=None):
-    """从用户输入的 prompt 中提取 @会话标题 引用。"""
+    """从用户输入的 prompt 中提取显式 @codex / @claude 会话标题引用（避免与客户端自带裸 @ 冲突）。
+    支持语法:
+      - @codex 会话标题 [后续提问]
+      - @claude 会话标题 [后续提问]
+      - @codex:会话标题 / @claude:会话标题
+      - @codex「含空格的会话标题」 / @claude "含空格的会话标题"
+    """
     if not prompt_text or "@" not in prompt_text:
         return []
+    if not re.search(r"@(?:codex|claude)\b", prompt_text, flags=re.IGNORECASE):
+        return []
 
-    other_agent = "codex" if current_agent == "claude" else "claude"
-    candidates = []
+    cached_by_agent = {}
 
-    # 1. 显式前缀 @codex:xxx 或 @claude:xxx
-    for m in re.finditer(
-        r"@(codex|claude)\s*[:：/]\s*(?:[「【《\"']([^」】》\"'\n]+)[」】》\"']|([^\s,，。！？!?\n]+))",
-        prompt_text,
-        flags=re.IGNORECASE,
-    ):
-        ag = m.group(1).lower()
-        kw = (m.group(2) or m.group(3) or "").strip()
-        if kw:
-            candidates.append((kw, ag, True))
-
-    # 2. 括号包裹 @「标题」 / @【标题】 / @"标题"
-    for m in re.finditer(r"@(?!(?:codex|claude)\s*[:：/])[「【《\"']([^」】》\"'\n]{2,80})[」】》\"']", prompt_text, flags=re.IGNORECASE):
-        kw = m.group(1).strip()
-        if kw:
-            candidates.append((kw, other_agent, True))
-
-    # 3. 裸 @标题（如 @订单结算重构 接着往下做）
-    if not candidates:
-        for m in re.finditer(r"(?:^|(?<=[\s,，。：:]))@([^\s@,，。！？!?\n]{2,60})", prompt_text):
-            token = m.group(1).strip()
-            if not token or token.lower().startswith(("codex:", "claude:", "codex：", "claude：")):
-                continue
-            if "/" in token or "\\" in token or re.search(r"\.[a-zA-Z0-9]{1,6}$", token):
-                if cwd and os.path.exists(os.path.join(cwd, token)):
-                    continue
-                if os.path.exists(token):
-                    continue
-            if cwd and os.path.exists(os.path.join(cwd, token)):
-                continue
-            candidates.append((token, other_agent, False))
+    def _get_agent_sessions(ag):
+        if ag not in cached_by_agent:
+            rows = all_sessions(ag)
+            rows.sort(key=lambda r: (len((r.get("title") or "").strip()), r.get("updated_ts", 0.0)), reverse=True)
+            cached_by_agent[ag] = rows
+        return cached_by_agent[ag]
 
     resolved = []
     seen_ids = set()
-    for kw, ag, is_explicit in candidates:
-        row, path = resolve(kw, ag)
-        if not row and ag != "all":
-            row, path = resolve(kw, "all")
-        if not row:
-            continue
-        if not is_explicit and score_candidate(row, kw.lower()) < 65:
-            continue
-        if row["id"] in seen_ids:
+
+    pattern = re.compile(
+        r"@(codex|claude)(?:\s*[:：/]\s*|\s+)(?:[「【《\"']([^」】》\"'\n]+)[」】》\"']|([^\n]+))",
+        flags=re.IGNORECASE,
+    )
+
+    for m in pattern.finditer(prompt_text):
+        ag = m.group(1).lower()
+        bracketed = (m.group(2) or "").strip()
+        rest_line = (m.group(3) or "").strip()
+
+        row, path = None, None
+        if bracketed:
+            row, path = resolve(bracketed, ag)
+        elif rest_line:
+            # 1. 先尝试最长前缀匹配已知会话标题（兼容标题本身带空格的情况）
+            rest_lower = rest_line.lower()
+            for cand in _get_agent_sessions(ag):
+                t = (cand.get("title") or "").strip()
+                if len(t) >= 3 and rest_lower.startswith(t.lower()):
+                    row, path = cand, find_rollout_for(cand)
+                    break
+            # 2. 若未完整前缀命中，取第一个词（空格或标点前）做关键词智能匹配
+            if not row:
+                first_token = re.split(r"[\s,，。！？!?；;：:]+", rest_line, maxsplit=1)[0].strip().strip('"\'「」【】《》')
+                if first_token:
+                    row, path = resolve(first_token, ag)
+
+        if not row or row["id"] in seen_ids:
             continue
         seen_ids.add(row["id"])
         resolved.append((row, path))
