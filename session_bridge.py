@@ -581,11 +581,11 @@ def find_rollout_for(row):
 
 
 def _parse_agent_prefix(key, default_agent="all"):
-    """支持 @codex 标题 / @claude 标题 / @codex:标题 / @claude:标题 / codex:标题 / claude:标题。"""
+    """支持 @codex标题 / @codex 标题 / @codex：标题 / @codex:标题 / @claude标题 等所有写法。"""
     s = (key or "").strip()
     if s.startswith("@"):
         s = s[1:].strip()
-    m = re.match(r"^(codex|claude)(?:\s*[:：/]\s*|\s+)(.+)$", s, flags=re.IGNORECASE)
+    m = re.match(r"^(codex|claude)(?:[\s:：/\-_]+|(?![a-zA-Z0-9]))(.+)$", s, flags=re.IGNORECASE)
     if m:
         return m.group(2).strip().strip('"\'「」【】《》'), m.group(1).lower()
     return s.strip('"\'「」【】《》'), default_agent
@@ -844,7 +844,7 @@ def extract_session_mentions_from_prompt(prompt_text, current_agent="claude", cw
     """
     if not prompt_text or "@" not in prompt_text:
         return []
-    if not re.search(r'@[「【《"\']?(?:codex|claude)\b', prompt_text, flags=re.IGNORECASE):
+    if not re.search(r'@[「【《"\']?(?:codex|claude)', prompt_text, flags=re.IGNORECASE):
         return []
 
     cached_by_agent = {}
@@ -859,9 +859,9 @@ def extract_session_mentions_from_prompt(prompt_text, current_agent="claude", cw
     resolved = []
     seen_ids = set()
 
-    # 兼容 @"codex:含空格标题" / @「codex:标题」 以及 @codex 标题 / @codex:标题 / @codex「标题」
+    # 兼容全拼无分隔符 (@codex标题)、空格 (@codex 标题)、中文冒号 (@codex：标题)、英文冒号/斜杠 (@codex:标题) 及引号包裹
     pattern = re.compile(
-        r"@(?:[「【《\"'](codex|claude)(?:\s*[:：/]\s*|\s+)([^」】》\"'\n]+)[」】》\"']|(codex|claude)(?:\s*[:：/]\s*|\s+)(?:[「【《\"']([^」】》\"'\n]+)[」】》\"']|([^\n]+)))",
+        r"@(?:[「【《\"'](codex|claude)[\s:：/\-_]*([^」】》\"'\n]+)[」】》\"']|(codex|claude)(?:[\s:：/\-_]+|(?![a-zA-Z]))(?:[「【《\"']([^」】》\"'\n]+)[」】》\"']|([^\n]+)))",
         flags=re.IGNORECASE,
     )
 
@@ -946,7 +946,7 @@ def cmd_hook(args):
     print(json.dumps(output, ensure_ascii=False))
 
 
-def _suggest_sessions_for_agent(agent, kw_raw, limit=15, include_prefix=True):
+def _suggest_sessions_for_agent(agent, kw_raw, limit=15, include_prefix=True, sep=""):
     kw = (kw_raw or "").strip().lower()
     rows = all_sessions(agent)
     scored = []
@@ -968,7 +968,7 @@ def _suggest_sessions_for_agent(agent, kw_raw, limit=15, include_prefix=True):
         count = seen_titles.get(t, 0)
         seen_titles[t] = count + 1
         label = t if count == 0 else "%s#%s" % (t, r["id"][:8])
-        out.append(("%s:%s" % (r["agent"], label)) if include_prefix else label)
+        out.append(("%s%s%s" % (r["agent"], sep, label)) if include_prefix else label)
     return out
 
 
@@ -1052,12 +1052,14 @@ def cmd_suggest(args):
         print(json.dumps(items, ensure_ascii=False))
         return
 
-    # 1. 输入了 @codex / @codex:xxx / @codex xxx 或 @claude...
-    m = re.match(r"^(codex|claude)(?:\s*[:：/\s]\s*(.*))?$", q, flags=re.IGNORECASE)
+    # 1. 输入了 @codex标题 / @codex：标题 / @codex 标题 / @codex:标题（无需冒号直接连打中文或任意分隔符均可）
+    m = re.match(r"^(codex|claude)([\s:：/\-_]*)(.*)$", q, flags=re.IGNORECASE)
     if m:
         ag = m.group(1).lower()
-        kw = (m.group(2) or "").strip()
-        for item in _suggest_sessions_for_agent(ag, kw, limit=args.limit, include_prefix=True):
+        raw_sep = m.group(2) or ""
+        sep = ":" if ":" in raw_sep else ("/" if "/" in raw_sep else ("-" if "-" in raw_sep else ""))
+        kw = (m.group(3) or "").strip()
+        for item in _suggest_sessions_for_agent(ag, kw, limit=args.limit, include_prefix=True, sep=sep):
             print(item)
         return
 
@@ -1065,18 +1067,18 @@ def cmd_suggest(args):
     q_low = q.lower()
     out = []
     if q_low and other_agent.startswith(q_low):
-        out.append("%s:" % other_agent)
-        out.extend(_suggest_sessions_for_agent(other_agent, "", limit=5, include_prefix=True))
+        out.append(other_agent)
+        out.extend(_suggest_sessions_for_agent(other_agent, "", limit=5, include_prefix=True, sep=""))
 
     # 3. 常规文件补全 + 跨端会话标题模糊命中补充
     files = _suggest_local_files(cwd, q, limit=max(5, args.limit - len(out)))
     out.extend(files)
 
     if not q:
-        out.append("%s:" % other_agent)
-        out.extend(_suggest_sessions_for_agent(other_agent, "", limit=5, include_prefix=True))
+        out.append(other_agent)
+        out.extend(_suggest_sessions_for_agent(other_agent, "", limit=5, include_prefix=True, sep=""))
     elif len(q) >= 2:
-        sess_hits = _suggest_sessions_for_agent(other_agent, q, limit=5, include_prefix=True)
+        sess_hits = _suggest_sessions_for_agent(other_agent, q, limit=5, include_prefix=True, sep="")
         for sh in sess_hits:
             if sh not in out:
                 out.append(sh)
