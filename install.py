@@ -2,7 +2,8 @@
 # -*- coding: utf-8 -*-
 """
 install.py — Cross-platform installer for claude-codex-session-bridge (codex-sessions skill).
-Automatically installs the skill, UserPromptSubmit hooks, and MCP servers for both:
+Automatically installs the skill, UserPromptSubmit hooks, fileSuggestion (@codex fuzzy autocomplete),
+and MCP servers ('codex' in Claude Code, 'claude' in Codex) for both:
   - Claude Code (CLI & Desktop/IDE Client)
   - OpenAI Codex (CLI & Desktop App)
 Supports Windows, macOS, and Linux with zero hardcoded paths.
@@ -12,7 +13,6 @@ import json
 import os
 import re
 import shutil
-import sys
 
 SKILL_NAME = "codex-sessions"
 CORE_FILES = ("SKILL.md", "session_bridge.py", "session_bridge_mcp.mjs", "install.py")
@@ -80,7 +80,7 @@ def install_files(src_dir, target_skill_dir):
 
 
 def configure_claude(claude_dir, bridge_py_slash, mcp_mjs_slash, py_cmd):
-    # 1. settings.json -> hooks.UserPromptSubmit
+    # 1. settings.json -> hooks.UserPromptSubmit + fileSuggestion (@codex 实时模糊补全)
     settings_path = os.path.join(claude_dir, "settings.json")
     settings = _load_json(settings_path, {})
     hooks = settings.setdefault("hooks", {})
@@ -98,15 +98,23 @@ def configure_claude(claude_dir, bridge_py_slash, mcp_mjs_slash, py_cmd):
             ups[0]["hooks"].append({"type": "command", "command": hook_cmd, "timeout": 10})
         else:
             ups.append({"hooks": [{"type": "command", "command": hook_cmd, "timeout": 10}]})
+
+    suggest_cmd = f'{py_cmd} "{bridge_py_slash}" suggest --current-agent claude'
+    settings["fileSuggestion"] = {
+        "type": "command",
+        "command": suggest_cmd,
+    }
     _save_json(settings_path, settings)
 
-    # 2. .mcp.json (if present in custom claudeConfigDir)
+    # 2. .mcp.json (if present in custom claudeConfigDir) -> register as "codex" so @codex:<title> works natively
     mcp_json_path = os.path.join(claude_dir, ".mcp.json")
     if os.path.isfile(mcp_json_path):
         mcp_cfg = _load_json(mcp_json_path, {})
-        mcp_cfg.setdefault("mcpServers", {})["session-bridge"] = {
+        servers = mcp_cfg.setdefault("mcpServers", {})
+        servers.pop("session-bridge", None)
+        servers["codex"] = {
             "command": "node",
-            "args": [mcp_mjs_slash],
+            "args": [mcp_mjs_slash, "--agent", "codex"],
         }
         _save_json(mcp_json_path, mcp_cfg)
 
@@ -114,10 +122,12 @@ def configure_claude(claude_dir, bridge_py_slash, mcp_mjs_slash, py_cmd):
 def configure_claude_root_mcp(mcp_mjs_slash):
     claude_json_path = os.path.expanduser("~/.claude.json")
     data = _load_json(claude_json_path, {})
-    data.setdefault("mcpServers", {})["session-bridge"] = {
+    servers = data.setdefault("mcpServers", {})
+    servers.pop("session-bridge", None)
+    servers["codex"] = {
         "type": "stdio",
         "command": "node",
-        "args": [mcp_mjs_slash],
+        "args": [mcp_mjs_slash, "--agent", "codex"],
         "env": {},
     }
     _save_json(claude_json_path, data)
@@ -149,35 +159,47 @@ def configure_codex(codex_dir, bridge_py_slash, bridge_py_win, mcp_mjs_slash, py
                         "command": cmd_posix,
                         "commandWindows": cmd_win,
                         "timeout": 10,
-                        "statusMessage": "Loading @session context",
+                        "statusMessage": "Loading @claude session context",
                     }
                 ]
             }
         )
     _save_json(hooks_path, hooks_data)
 
-    # 2. config.toml -> [mcp_servers.session-bridge]
+    # 2. config.toml -> [mcp_servers.claude]
     config_toml_path = os.path.join(codex_dir, "config.toml")
     toml_text = ""
     if os.path.isfile(config_toml_path):
         with open(config_toml_path, encoding="utf-8") as f:
             toml_text = f.read()
 
+    # Remove legacy [mcp_servers.session-bridge] block if present
+    toml_text = re.sub(
+        r"\n*\[mcp_servers\.session-bridge\][\s\S]*?(?=\n\[|\Z)",
+        "",
+        toml_text,
+    )
+    toml_text = re.sub(
+        r"\n*\[mcp_servers\.session-bridge\.env\][\s\S]*?(?=\n\[|\Z)",
+        "",
+        toml_text,
+    )
+
     block = (
-        "\n[mcp_servers.session-bridge]\n"
+        "\n[mcp_servers.claude]\n"
         'command = "node"\n'
-        f'args = ["{mcp_mjs_slash}"]\n'
+        f'args = ["{mcp_mjs_slash}", "--agent", "claude"]\n'
         "startup_timeout_sec = 30\n"
         "tool_timeout_sec = 60\n\n"
-        "[mcp_servers.session-bridge.env]\n"
+        "[mcp_servers.claude.env]\n"
         'PYTHONUTF8 = "1"\n'
         'PYTHONIOENCODING = "utf-8"\n'
     )
 
-    if "[mcp_servers.session-bridge]" not in toml_text:
+    if "[mcp_servers.claude]" not in toml_text:
         toml_text = toml_text.rstrip() + "\n" + block
-        with open(config_toml_path, "w", encoding="utf-8") as f:
-            f.write(toml_text)
+    with open(config_toml_path, "w", encoding="utf-8") as f:
+        f.write(toml_text)
 
 
 def main():
@@ -207,7 +229,7 @@ def main():
     for cdir in claude_dirs:
         print("  -", os.path.join(cdir, "skills", SKILL_NAME))
     print("  -", os.path.join(codex_dir, "skills", SKILL_NAME))
-    print("[OK] UserPromptSubmit hooks & session-bridge MCP server configured for both Claude Code and Codex.")
+    print("[OK] @codex / @claude fuzzy autocomplete (fileSuggestion + MCP completion) and hooks configured.")
 
 
 if __name__ == "__main__":

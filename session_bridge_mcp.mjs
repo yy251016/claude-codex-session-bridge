@@ -2,11 +2,10 @@
 /**
  * session_bridge_mcp.mjs
  * Zero-dependency MCP Server (stdio) for Claude Code (CLI & Desktop/IDE) and Codex (CLI & Desktop App).
- * Exposes:
- *   - Resources: All Codex & Claude sessions (enables @-mention resource picker in clients)
- *   - Tools:
- *       - search_sessions: Search all Codex and/or Claude sessions by title, keyword, or list all sessions
- *       - read_session: Read full conversation history (from message #1 to end) of a Codex or Claude session
+ * Supports:
+ *   - Real-time @codex:<fuzzy-query> autocomplete via MCP Resources + Resource Template Completion (completion/complete)
+ *   - Direct @codex:<title> resource reading (resources/read)
+ *   - Tools: search_sessions, read_session
  */
 import { execFile } from "node:child_process";
 import path from "node:path";
@@ -16,6 +15,15 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const BRIDGE_PY = path.join(__dirname, "session_bridge.py");
 const PYTHON_CANDIDATES = process.platform === "win32" ? ["python", "python3"] : ["python3", "python"];
+
+// Parse optional --agent codex|claude|all flag
+let defaultTargetAgent = "all";
+for (let i = 2; i < process.argv.length; i++) {
+  if (process.argv[i] === "--agent" && process.argv[i + 1]) {
+    defaultTargetAgent = process.argv[i + 1].toLowerCase();
+    i++;
+  }
+}
 
 function runBridgeWithCmd(pyCmd, args, timeoutMs) {
   return new Promise((resolve, reject) => {
@@ -29,7 +37,7 @@ function runBridgeWithCmd(pyCmd, args, timeoutMs) {
         windowsHide: true,
         env: { ...process.env, PYTHONUTF8: "1", PYTHONIOENCODING: "utf-8" },
       },
-      (err, stdout, stderr) => {
+      (err, stdout) => {
         if (err && !stdout) {
           reject(err);
           return;
@@ -53,6 +61,68 @@ async function runBridge(args, timeoutMs = 30000) {
     }
   }
   throw new Error(lastErr?.stderr || lastErr?.message || "Failed to execute session_bridge.py");
+}
+
+// In-memory session cache for <1ms fuzzy autocomplete
+let cachedSessions = [];
+let lastCacheMs = 0;
+let refreshPromise = null;
+
+async function getSessionsCached(force = false) {
+  const now = Date.now();
+  if (!force && cachedSessions.length > 0 && now - lastCacheMs < 8000) {
+    return cachedSessions;
+  }
+  if (refreshPromise) return refreshPromise;
+  refreshPromise = (async () => {
+    try {
+      const raw = await runBridge(["list-json", "--agent", defaultTargetAgent, "--limit", "1000"]);
+      const items = JSON.parse(raw || "[]").filter((it) => it.has_transcript && it.title);
+      const seenTitles = new Map();
+      for (const it of items) {
+        const cleanTitle = it.title.replace(/[\r\n]+/g, " ").trim();
+        const cnt = seenTitles.get(cleanTitle) || 0;
+        seenTitles.set(cleanTitle, cnt + 1);
+        it.uniqueTitle = cnt === 0 ? cleanTitle : `${cleanTitle}#${it.id.slice(0, 8)}`;
+        it.cleanTitle = cleanTitle;
+      }
+      cachedSessions = items;
+      lastCacheMs = Date.now();
+    } catch {
+      // Keep existing cache on transient error
+    } finally {
+      refreshPromise = null;
+    }
+    return cachedSessions;
+  })();
+  return refreshPromise;
+}
+
+// Pre-warm cache immediately on server startup
+getSessionsCached();
+
+function isSubsequence(small, large) {
+  if (!small || !large || small.length > large.length) return false;
+  let j = 0;
+  for (let i = 0; i < large.length && j < small.length; i++) {
+    if (large[i] === small[j]) j++;
+  }
+  return j === small.length;
+}
+
+function scoreSession(item, query) {
+  if (!query) return 50;
+  const q = query.toLowerCase().trim();
+  const title = (item.cleanTitle || "").toLowerCase();
+  const cwd = (item.cwd || "").toLowerCase();
+  if (title === q) return 100;
+  if (title.startsWith(q)) return 90;
+  if (title.includes(q)) return 80;
+  const tokens = q.split(/\s+/).filter(Boolean);
+  if (tokens.length > 1 && tokens.every((t) => title.includes(t))) return 75;
+  if (q.length >= 2 && isSubsequence(q.replace(/\s+/g, ""), title)) return 65;
+  if (cwd.includes(q)) return 40;
+  return 0;
 }
 
 const TOOLS = [
@@ -83,7 +153,7 @@ const TOOLS = [
   {
     name: "read_session",
     description:
-      "Read the full conversation transcript (from message #1 to the last message by default) of a Codex or Claude Code session by its title (e.g., '@订单结算重构' or '登录鉴权优化') or session ID prefix.",
+      "Read the full conversation transcript (from message #1 to the last message by default) of a Codex or Claude Code session by its title (e.g., '@codex 订单结算重构' or '登录鉴权优化') or session ID prefix.",
     inputSchema: {
       type: "object",
       properties: {
@@ -128,11 +198,12 @@ async function handleRequest(msg) {
       protocolVersion: clientVersion,
       capabilities: {
         resources: { listChanged: false },
+        completions: {},
         tools: { listChanged: false },
       },
       serverInfo: {
-        name: "session-bridge",
-        version: "2.1.0",
+        name: defaultTargetAgent === "all" ? "session-bridge" : defaultTargetAgent,
+        version: "2.2.0",
       },
     };
   }
@@ -142,50 +213,69 @@ async function handleRequest(msg) {
   }
 
   if (method === "resources/list") {
-    try {
-      const raw = await runBridge(["list-json", "--agent", "all", "--limit", "1000"]);
-      const items = JSON.parse(raw || "[]");
-      const resources = items
-        .filter((it) => it.has_transcript && it.title)
-        .map((it) => {
-          const tag = it.agent === "codex" ? "Codex" : "Claude";
-          const safeTitle = it.title.replace(/[\r\n]+/g, " ").trim();
-          return {
-            uri: `session://${it.agent}/${it.id}`,
-            name: `${it.agent} ${safeTitle}`,
-            description: `${tag} 会话 (${it.updated_at}) | cwd: ${it.cwd || "-"} | ID: ${it.id}`,
-            mimeType: "text/markdown",
-          };
-        });
-      return { resources };
-    } catch {
-      return { resources: [] };
-    }
+    const items = await getSessionsCached();
+    const resources = items.map((it) => {
+      const tag = it.agent === "codex" ? "Codex" : "Claude";
+      return {
+        uri: it.uniqueTitle,
+        name: it.cleanTitle,
+        description: `${tag} 会话 (${it.updated_at}) | cwd: ${it.cwd || "-"}`,
+        mimeType: "text/markdown",
+      };
+    });
+    return { resources };
   }
 
   if (method === "resources/templates/list") {
+    const label = defaultTargetAgent === "claude" ? "Claude" : "Codex";
     return {
       resourceTemplates: [
         {
-          uriTemplate: "session://{agent}/{query}",
-          name: "按标题或ID读取跨端完整会话 (codex/claude)",
-          description: "通过 session://codex/会话标题 或 session://claude/会话标题 直接引用完整对话记录",
+          uriTemplate: "{title}",
+          name: `${label} 历史会话模糊检索`,
+          description: `输入关键词实时模糊匹配 ${label} 历史会话标题`,
           mimeType: "text/markdown",
         },
       ],
     };
   }
 
+  if (method === "completion/complete") {
+    const rawVal = String(params?.argument?.value || "").trim();
+    const items = await getSessionsCached();
+    const scored = [];
+    for (const it of items) {
+      const sc = scoreSession(it, rawVal);
+      if (sc > 0) {
+        scored.push({ sc, item: it });
+      }
+    }
+    scored.sort((a, b) => b.sc - a.sc);
+    const values = scored.slice(0, 50).map((x) => x.item.uniqueTitle);
+    return {
+      completion: {
+        values,
+        total: scored.length,
+        hasMore: scored.length > 50,
+      },
+    };
+  }
+
   if (method === "resources/read") {
-    const uri = params?.uri || "";
-    const match = uri.match(/^session:\/\/(codex|claude|all)\/(.+)$/i);
-    const agent = match ? match[1].toLowerCase() : "all";
-    const key = match ? decodeURIComponent(match[2]) : uri;
+    const rawUri = params?.uri || "";
+    const match = rawUri.match(/^session:\/\/(codex|claude|all)\/(.+)$/i);
+    const agent = match ? match[1].toLowerCase() : defaultTargetAgent;
+    let key = match ? decodeURIComponent(match[2]) : decodeURIComponent(rawUri);
+    // If key ends with #shortId (from duplicate title disambiguation), use the shortId directly for exact lookup
+    const hashMatch = key.match(/#([0-9a-fA-F]{6,12})$/);
+    if (hashMatch) {
+      key = hashMatch[1];
+    }
     const text = await runBridge(["read", key, "--agent", agent, "--full"]);
     return {
       contents: [
         {
-          uri,
+          uri: rawUri,
           mimeType: "text/markdown",
           text: text || `未找到会话: ${key}`,
         },
@@ -203,7 +293,7 @@ async function handleRequest(msg) {
 
     if (name === "search_sessions") {
       const q = String(args.query || "").trim();
-      const agent = String(args.agent || "all").toLowerCase();
+      const agent = String(args.agent || defaultTargetAgent).toLowerCase();
       const limit = args.limit !== undefined ? String(args.limit) : "100";
       const cliArgs = ["search"];
       if (q) cliArgs.push(q);
@@ -223,7 +313,7 @@ async function handleRequest(msg) {
           content: [{ type: "text", text: "参数错误: 必须提供 query (会话标题或 ID 前缀)" }],
         };
       }
-      const agent = String(args.agent || "all").toLowerCase();
+      const agent = String(args.agent || defaultTargetAgent).toLowerCase();
       const cliArgs = [
         "read",
         q,

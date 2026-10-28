@@ -591,24 +591,40 @@ def _parse_agent_prefix(key, default_agent="all"):
     return s.strip('"\'「」【】《》'), default_agent
 
 
+def _is_subsequence(small, large):
+    if not small or not large or len(small) > len(large):
+        return False
+    it = iter(large)
+    return all(ch in it for ch in small)
+
+
 def score_candidate(row, kw_lower):
     title = (row.get("title") or "").strip().lower()
     first_msg = (row.get("first_user_message") or "").strip().lower()
     raw_title = (row.get("raw_title") or "").strip().lower()
 
+    if not kw_lower:
+        return 50 if title else 0
+
     score = 0
     if title == kw_lower:
         score = 100
     elif title.startswith(kw_lower):
-        score = 85
+        score = 90
     elif kw_lower in title:
-        score = 75
+        score = 80
     elif kw_lower and title and title in kw_lower and len(title) >= 4:
-        score = 65
-    elif kw_lower in first_msg:
-        score = 35
-    elif kw_lower in raw_title:
-        score = 25
+        score = 70
+    else:
+        tokens = [t for t in re.split(r"\s+", kw_lower) if t]
+        if len(tokens) > 1 and all(t in title for t in tokens):
+            score = 72
+        elif len(kw_lower) >= 2 and _is_subsequence(kw_lower.replace(" ", ""), title):
+            score = 62
+        elif kw_lower in first_msg:
+            score = 35
+        elif kw_lower in raw_title:
+            score = 25
 
     if score > 0 and row.get("path"):
         score += 5
@@ -828,7 +844,7 @@ def extract_session_mentions_from_prompt(prompt_text, current_agent="claude", cw
     """
     if not prompt_text or "@" not in prompt_text:
         return []
-    if not re.search(r"@(?:codex|claude)\b", prompt_text, flags=re.IGNORECASE):
+    if not re.search(r'@[「【《"\']?(?:codex|claude)\b', prompt_text, flags=re.IGNORECASE):
         return []
 
     cached_by_agent = {}
@@ -843,22 +859,26 @@ def extract_session_mentions_from_prompt(prompt_text, current_agent="claude", cw
     resolved = []
     seen_ids = set()
 
+    # 兼容 @"codex:含空格标题" / @「codex:标题」 以及 @codex 标题 / @codex:标题 / @codex「标题」
     pattern = re.compile(
-        r"@(codex|claude)(?:\s*[:：/]\s*|\s+)(?:[「【《\"']([^」】》\"'\n]+)[」】》\"']|([^\n]+))",
+        r"@(?:[「【《\"'](codex|claude)(?:\s*[:：/]\s*|\s+)([^」】》\"'\n]+)[」】》\"']|(codex|claude)(?:\s*[:：/]\s*|\s+)(?:[「【《\"']([^」】》\"'\n]+)[」】》\"']|([^\n]+)))",
         flags=re.IGNORECASE,
     )
 
     for m in pattern.finditer(prompt_text):
-        ag = m.group(1).lower()
-        bracketed = (m.group(2) or "").strip()
-        rest_line = (m.group(3) or "").strip()
+        ag = (m.group(1) or m.group(3) or "").lower()
+        bracketed = (m.group(2) or m.group(4) or "").strip()
+        rest_line = (m.group(5) or "").strip()
 
         row, path = None, None
         if bracketed:
-            row, path = resolve(bracketed, ag)
+            # 剥离可能带有的 #shortId 后缀
+            clean_b = re.sub(r"#[0-9a-fA-F]{6,12}$", "", bracketed).strip()
+            row, path = resolve(clean_b, ag)
         elif rest_line:
+            rest_clean = re.sub(r"#[0-9a-fA-F]{6,12}(?=\s|$)", "", rest_line)
             # 1. 先尝试最长前缀匹配已知会话标题（兼容标题本身带空格的情况）
-            rest_lower = rest_line.lower()
+            rest_lower = rest_clean.lower()
             for cand in _get_agent_sessions(ag):
                 t = (cand.get("title") or "").strip()
                 if len(t) >= 3 and rest_lower.startswith(t.lower()):
@@ -866,7 +886,7 @@ def extract_session_mentions_from_prompt(prompt_text, current_agent="claude", cw
                     break
             # 2. 若未完整前缀命中，取第一个词（空格或标点前）做关键词智能匹配
             if not row:
-                first_token = re.split(r"[\s,，。！？!?；;：:]+", rest_line, maxsplit=1)[0].strip().strip('"\'「」【】《》')
+                first_token = re.split(r"[\s,，。！？!?；;：:]+", rest_clean, maxsplit=1)[0].strip().strip('"\'「」【】《》')
                 if first_token:
                     row, path = resolve(first_token, ag)
 
@@ -926,6 +946,145 @@ def cmd_hook(args):
     print(json.dumps(output, ensure_ascii=False))
 
 
+def _suggest_sessions_for_agent(agent, kw_raw, limit=15, include_prefix=True):
+    kw = (kw_raw or "").strip().lower()
+    rows = all_sessions(agent)
+    scored = []
+    for r in rows:
+        t = (r.get("title") or "").strip()
+        if not t:
+            continue
+        sc = score_candidate(r, kw) if kw else 50
+        if sc >= 50:
+            scored.append((sc, r.get("updated_ts", 0.0), r.get("updated_at", ""), r))
+
+    scored.sort(key=lambda x: (x[0], x[1], x[2]), reverse=True)
+    out = []
+    seen_titles = {}
+    for _, _, _, r in scored[:limit]:
+        t = re.sub(r"[\r\n]+", " ", (r.get("title") or "").strip())
+        if not t:
+            continue
+        count = seen_titles.get(t, 0)
+        seen_titles[t] = count + 1
+        label = t if count == 0 else "%s#%s" % (t, r["id"][:8])
+        out.append(("%s:%s" % (r["agent"], label)) if include_prefix else label)
+    return out
+
+
+def _suggest_local_files(cwd, query, limit=15):
+    if not cwd or not os.path.isdir(cwd):
+        return []
+    q = (query or "").strip().replace("\\", "/")
+    if q.startswith("./"):
+        q = q[2:]
+    q_low = q.lower()
+
+    results = []
+    ignore_dirs = {".git", "node_modules", "__pycache__", ".idea", ".vscode", "target", "dist", "build", ".next", "venv", ".venv"}
+
+    if not q_low:
+        try:
+            for entry in os.scandir(cwd):
+                if entry.name.startswith(".") and entry.name in ignore_dirs:
+                    continue
+                results.append(entry.name + ("/" if entry.is_dir() else ""))
+                if len(results) >= limit:
+                    break
+        except OSError:
+            pass
+        return results
+
+    try:
+        scanned = 0
+        for root, dirs, files in os.walk(cwd):
+            dirs[:] = [d for d in dirs if d not in ignore_dirs and not d.startswith(".git")]
+            rel_root = os.path.relpath(root, cwd).replace("\\", "/")
+            if rel_root == ".":
+                rel_root = ""
+            for d in dirs:
+                rel_p = ("%s/%s/" % (rel_root, d)) if rel_root else ("%s/" % d)
+                if q_low in rel_p.lower():
+                    results.append(rel_p)
+            for f in files:
+                rel_p = ("%s/%s" % (rel_root, f)) if rel_root else f
+                if q_low in rel_p.lower() or _is_subsequence(q_low, f.lower()):
+                    results.append(rel_p)
+            scanned += len(files) + len(dirs)
+            if len(results) >= limit * 2 or scanned > 5000:
+                break
+    except OSError:
+        pass
+
+    results.sort(key=lambda p: (0 if os.path.basename(p.rstrip("/")).lower().startswith(q_low) else 1, len(p), p))
+    return results[:limit]
+
+
+def cmd_suggest(args):
+    """供 Claude Code fileSuggestion 与 MCP completion/complete 调用的毫秒级 @ 模糊补全。"""
+    query = args.query
+    cwd = os.getcwd()
+
+    if query is None:
+        try:
+            raw_bytes = sys.stdin.buffer.read()
+            if raw_bytes:
+                try:
+                    raw = raw_bytes.decode("utf-8-sig").strip()
+                except UnicodeDecodeError:
+                    raw = raw_bytes.decode("gbk", errors="replace").strip()
+                if raw:
+                    data = json.loads(raw)
+                    query = data.get("query", "")
+                    if data.get("cwd"):
+                        cwd = data["cwd"]
+        except Exception:
+            query = ""
+
+    q = (query or "").strip()
+    if q.startswith("@"):
+        q = q[1:].strip()
+
+    other_agent = "codex" if args.current_agent == "claude" else "claude"
+
+    if args.values_only:
+        items = _suggest_sessions_for_agent(other_agent, q, limit=args.limit, include_prefix=False)
+        print(json.dumps(items, ensure_ascii=False))
+        return
+
+    # 1. 输入了 @codex / @codex:xxx / @codex xxx 或 @claude...
+    m = re.match(r"^(codex|claude)(?:\s*[:：/\s]\s*(.*))?$", q, flags=re.IGNORECASE)
+    if m:
+        ag = m.group(1).lower()
+        kw = (m.group(2) or "").strip()
+        for item in _suggest_sessions_for_agent(ag, kw, limit=args.limit, include_prefix=True):
+            print(item)
+        return
+
+    # 2. 正在输入前缀（如 @c / @co / @cod / @code）
+    q_low = q.lower()
+    out = []
+    if q_low and other_agent.startswith(q_low):
+        out.append("%s:" % other_agent)
+        out.extend(_suggest_sessions_for_agent(other_agent, "", limit=5, include_prefix=True))
+
+    # 3. 常规文件补全 + 跨端会话标题模糊命中补充
+    files = _suggest_local_files(cwd, q, limit=max(5, args.limit - len(out)))
+    out.extend(files)
+
+    if not q:
+        out.append("%s:" % other_agent)
+        out.extend(_suggest_sessions_for_agent(other_agent, "", limit=5, include_prefix=True))
+    elif len(q) >= 2:
+        sess_hits = _suggest_sessions_for_agent(other_agent, q, limit=5, include_prefix=True)
+        for sh in sess_hits:
+            if sh not in out:
+                out.append(sh)
+
+    for item in out[: args.limit]:
+        print(item)
+
+
 def main():
     ap = argparse.ArgumentParser(description="Claude ⇄ Codex 会话互读/接力（全量无损版）")
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -969,6 +1128,13 @@ def main():
     hk = sub.add_parser("hook", help="UserPromptSubmit 钩子自动注入 @会话标题 全量对话")
     hk.add_argument("--current-agent", default="claude", choices=["claude", "codex"])
     hk.set_defaults(func=cmd_hook)
+
+    sg = sub.add_parser("suggest", help="@ 菜单实时模糊补全（支持 @codex:关键词 与文件补全）")
+    sg.add_argument("--current-agent", default="claude", choices=["claude", "codex"])
+    sg.add_argument("--query", default=None, help="直接传入查询词（不传则从 stdin JSON 读取）")
+    sg.add_argument("--limit", type=int, default=15)
+    sg.add_argument("--values-only", action="store_true", help="仅输出 JSON 标题数组供 MCP completion 使用")
+    sg.set_defaults(func=cmd_suggest)
 
     args = ap.parse_args()
     args.func(args)
