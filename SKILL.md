@@ -7,18 +7,20 @@ description: 检索并读取本机 Claude Code 与 Codex 的完整历史会话�
 
 本技能提供三层双向会话桥接机制，无需导出或切换终端即可在 **Claude Code（CLI & 桌面/IDE 客户端）** 与 **Codex（CLI & 桌面端）** 之间直接按会话标题引用并继续对话，默认全量加载从 `#1` 到最后一条的完整对话：
 
-## 1. 自动注入层（UserPromptSubmit Hook，显式前缀防冲突）
-为了不与 Codex 客户端自带的 `@`（引用 Codex 自身会话或文件）以及 Claude 自带的 `@文件` 冲突，仅当用户输入显式前缀 `@codex` 或 `@claude` 时触发跨端会话自动注入：
-- **在 Claude 中引用 Codex 会话**：
-  - `@codex 订单结算重构 接着刚才的做`
-  - `@codex:订单结算重构 接着刚才的做`
-  - `@codex「含空格的会话标题」 继续`
-- **在 Codex 中引用 Claude 会话**：
-  - `@claude 登录鉴权排查 继续分析`
-  - `@claude:登录鉴权排查 继续分析`
-  - `@claude「含空格的会话标题」 继续`
-
-`UserPromptSubmit` 钩子会在毫秒级自动检索对应会话的**完整对话历史（从 `#1` 到最后一条消息）**，并以 `<cross-session-context>...</cross-session-context>` 标签注入到本轮上下文中。
+## 1. 自动注入层（UserPromptSubmit Hook，智能 @ 语法与防冲突）
+为了不与 Codex 客户端自带的 `@`（引用 Codex 自身会话或文件）以及 Claude 自带的 `@文件` 冲突，只要用户输入带 `@codex` 或 `@claude` 前缀时自动触发跨端会话桥接注入：
+- **人性化输入支持（免冒号、智能分词、直接连写中英文）**：
+  - `@claude店发测试 帮我分析` / `@codex店发测试 接着做`（直接连写，最推荐）
+  - `@claude：店发测试` / `@codex：店发测试`（中文冒号兼容）
+  - `@claude:店发测试` / `@codex:店发测试`（英文冒号兼容）
+  - `@claude 店发测试` / `@codex 店发测试`（空格分隔兼容）
+  - `@claude"店发测试"` / `@codex“店发测试”`（引号精准包裹）
+  - `[@codex 店发测试](thread://...)`（兼容客户端下拉或拖拽生成的 Markdown 链接）
+  - 自然语言 `引用codex:店发测试` / `同步claude店发测试`
+- **视觉透明与智能反馈横幅**：
+  - **唯一/精准匹配**：以 `<cross-session-context>` 注入**从 `#1` 到最后一条消息的完整真实对话**，并标注目标 Agent、标题、ID、更新时间和消息总数。
+  - **多项匹配提示**：自动注入最新的一条会话，同时在提示横幅中列出其余候选会话及对应的精确引用语法（如 `@claude完整标题`）。
+  - **0 命中友好提示**：若未搜到关键词，列出目标 Agent 最近的 3 个活跃会话及对应语法，方便向用户确认。
 - **如果当前上下文中已存在 `<cross-session-context>`**：请直接基于其中的历史对话与工作目录（`cwd`）继续推进任务，**不要**再重复调用工具去搜索同一会话。
 
 ## 2. MCP 协议层（`session-bridge` MCP Server）
@@ -35,17 +37,21 @@ description: 检索并读取本机 Claude Code 与 Codex 的完整历史会话�
 ```bash
 SB="$HOME/.claude/skills/codex-sessions/session_bridge.py"
 
-# 1. 按标题或关键词直接读取会话从 #1 到末尾的全量对话（支持 @codex 标题 / @claude 标题）
+# 1. 毫秒级模糊查询历史会话表格与快捷引用语法（支持关键词/子序列模糊匹配）
+python "$SB" list "关键词"
+python "$SB" ls
+
+# 2. 按标题或关键词直接读取会话从 #1 到末尾的全量对话（支持 @codex 标题 / @claude 标题）
 python "$SB" read "会话标题或ID前缀" --agent all --full
 
-# 2. 按消息序号区间或关键词在会话内检索
+# 3. 按消息序号区间或关键词在会话内检索
 python "$SB" read "会话标题或ID前缀" --start 1 --end 50
 python "$SB" read "会话标题或ID前缀" --grep "关键词"
 
-# 3. 搜索匹配的候选会话（全量扫描本机历史会话）
+# 4. 搜索匹配的候选会话（全量扫描本机历史会话）
 python "$SB" search "关键词" --agent all
 
-# 4. 导出完整 Markdown 交接包（可选留档）
+# 5. 导出完整 Markdown 交接包（可选留档）
 python "$SB" handoff "会话标题或ID前缀" --to codex
 ```
 

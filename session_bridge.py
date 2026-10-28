@@ -3,6 +3,8 @@
 """session_bridge.py — Claude Code ⇄ Codex 会话互读/接力工具（支持 @会话标题 毫秒级自动注入与 MCP/CLI/客户端通用）。
 
 子命令:
+  list [关键词] [--agent codex|claude|all] [--limit N]
+      毫秒级模糊查询历史会话标题与快捷引用语法（支持中英文/子序列/模糊匹配）
   search [关键词] [--agent codex|claude|all] [--limit N]
       按标题/首条消息/日期搜会话（关键词为空时列出最近会话）
   read <id前缀|标题关键词> [--agent ...] [--tail N] [--max-chars C] [--full]
@@ -15,6 +17,8 @@
       输出 JSON 格式的最近会话列表（供 MCP Resources 与脚本调用）
   hook [--current-agent claude|codex]
       UserPromptSubmit 钩子：从 stdin 读取 prompt，自动识别 @会话标题 并注入该会话上下文
+  suggest [--current-agent claude|codex] [--query Q]
+      实时模糊补全接口（供 Claude Code fileSuggestion 等调用）
 """
 import argparse
 import glob
@@ -631,21 +635,21 @@ def score_candidate(row, kw_lower):
     return score
 
 
-def resolve(key, agent="all"):
-    """返回 (row, path)。path 为 None 表示正文已丢。"""
+def resolve_candidates(key, agent="all", limit=5):
+    """返回按匹配度及更新时间降序的候选列表: [(score, row, path), ...]"""
     clean_key, target_agent = _parse_agent_prefix(key, agent)
     if not clean_key:
-        return None, None
+        return []
 
     sessions = all_sessions(target_agent)
     if looks_like_id(clean_key):
         norm_k = clean_key.replace("-", "").lower()
         for row in sessions:
             if row["id"].replace("-", "").lower().startswith(norm_k):
-                return row, find_rollout_for(row)
-        return None, None
+                return [(1000.0, row, find_rollout_for(row))]
+        return []
 
-    kw = clean_key.lower()
+    kw = clean_key.lower().strip()
     scored = []
     for r in sessions:
         sc = score_candidate(r, kw)
@@ -653,11 +657,18 @@ def resolve(key, agent="all"):
             scored.append((sc, r.get("updated_ts", 0.0), r.get("updated_at", ""), r))
 
     if not scored:
-        return None, None
+        return []
 
     scored.sort(key=lambda x: (x[0], x[1], x[2]), reverse=True)
-    best = scored[0][3]
-    return best, find_rollout_for(best)
+    return [(item[0], item[3], find_rollout_for(item[3])) for item in scored[:limit]]
+
+
+def resolve(key, agent="all"):
+    """返回 (row, path)。path 为 None 表示正文已丢。"""
+    cands = resolve_candidates(key, agent=agent, limit=1)
+    if cands:
+        return cands[0][1], cands[0][2]
+    return None, None
 
 
 def load_messages(row, path, tail=None):
@@ -835,17 +846,33 @@ def cmd_list_json(args):
 
 
 def extract_session_mentions_from_prompt(prompt_text, current_agent="claude", cwd=None):
-    """从用户输入的 prompt 中提取显式 @codex / @claude 会话标题引用（避免与客户端自带裸 @ 冲突）。
-    支持语法:
-      - @codex 会话标题 [后续提问]
-      - @claude 会话标题 [后续提问]
-      - @codex:会话标题 / @claude:会话标题
-      - @codex「含空格的会话标题」 / @claude "含空格的会话标题"
+    """从用户输入的 prompt 中提取跨 Agent 会话引用。
+    支持多种人性化 @ 语法（无需冒号，智能分词）：
+      - @codex店发测试 或 @claude店发测试 (直接连写，最推荐)
+      - @codex：店发测试 或 @claude：店发测试 (中文冒号兼容)
+      - @codex:店发测试 或 @claude:店发测试 (英文冒号兼容)
+      - @codex 店发测试 或 @claude 店发测试 (空格分隔兼容)
+      - @codex"店发测试" 或 @claude“店发测试” (引号包裹)
+      - [@codex 标题](thread://...) (兼容客户端下拉插入的 Markdown 链接)
+      - 引用codex:店发测试 / 接claude店发测试 (自然语言无符号引用)
     """
-    if not prompt_text or "@" not in prompt_text:
+    TRIGGER_CHARS = ("@", "#", "引用", "同步", "接", "查")
+    if not prompt_text or not any(ch in prompt_text for ch in TRIGGER_CHARS):
         return []
-    if not re.search(r'@[「【《"\']?(?:codex|claude)', prompt_text, flags=re.IGNORECASE):
-        return []
+
+    pattern = re.compile(
+        r"(?:\[?\s*(?:[@#]|(?:引用|同步|接|查))\s*"
+        r"(codex|claude)"
+        r"(?:[\s:：/\-_]+|(?![a-zA-Z]))"
+        r"(?:"
+        r'["\'“]([^"\'”\n\r]+)["\'”]'
+        r"|"
+        r"([^\]\)\n\r]+)\]\((?:thread://[^\)]+|[^\)]+)\)"
+        r"|"
+        r"([^\n\r]+)"
+        r"))",
+        flags=re.IGNORECASE,
+    )
 
     cached_by_agent = {}
 
@@ -856,46 +883,67 @@ def extract_session_mentions_from_prompt(prompt_text, current_agent="claude", cw
             cached_by_agent[ag] = rows
         return cached_by_agent[ag]
 
-    resolved = []
+    matches = []
     seen_ids = set()
 
-    # 兼容全拼无分隔符 (@codex标题)、空格 (@codex 标题)、中文冒号 (@codex：标题)、英文冒号/斜杠 (@codex:标题) 及引号包裹
-    pattern = re.compile(
-        r"@(?:[「【《\"'](codex|claude)[\s:：/\-_]*([^」】》\"'\n]+)[」】》\"']|(codex|claude)(?:[\s:：/\-_]+|(?![a-zA-Z]))(?:[「【《\"']([^」】》\"'\n]+)[」】》\"']|([^\n]+)))",
-        flags=re.IGNORECASE,
-    )
-
     for m in pattern.finditer(prompt_text):
-        ag = (m.group(1) or m.group(3) or "").lower()
-        bracketed = (m.group(2) or m.group(4) or "").strip()
-        rest_line = (m.group(5) or "").strip()
+        ag = (m.group(1) or "").lower()
+        bracketed = (m.group(2) or m.group(3) or "").strip()
+        rest_line = (m.group(4) or "").strip()
 
-        row, path = None, None
+        query = ""
         if bracketed:
-            # 剥离可能带有的 #shortId 后缀
-            clean_b = re.sub(r"#[0-9a-fA-F]{6,12}$", "", bracketed).strip()
-            row, path = resolve(clean_b, ag)
+            query = re.sub(r"#[0-9a-fA-F]{6,12}$", "", bracketed).strip()
         elif rest_line:
             rest_clean = re.sub(r"#[0-9a-fA-F]{6,12}(?=\s|$)", "", rest_line)
-            # 1. 先尝试最长前缀匹配已知会话标题（兼容标题本身带空格的情况）
             rest_lower = rest_clean.lower()
+            # 1. 优先尝试最长前缀匹配已知会话标题（即使标题本身含空格）
+            matched_title = None
             for cand in _get_agent_sessions(ag):
                 t = (cand.get("title") or "").strip()
-                if len(t) >= 3 and rest_lower.startswith(t.lower()):
-                    row, path = cand, find_rollout_for(cand)
+                if len(t) >= 2 and rest_lower.startswith(t.lower()):
+                    matched_title = t
                     break
-            # 2. 若未完整前缀命中，取第一个词（空格或标点前）做关键词智能匹配
-            if not row:
-                first_token = re.split(r"[\s,，。！？!?；;：:]+", rest_clean, maxsplit=1)[0].strip().strip('"\'「」【】《》')
-                if first_token:
-                    row, path = resolve(first_token, ag)
+            if matched_title:
+                query = matched_title
+            else:
+                # 2. 取第一个词（空格或常见标点之前）
+                first_token = re.split(r"[\s,，。！？!?；;：:]+", rest_clean, maxsplit=1)[0].strip().strip('"\'「」【】《》“”')
+                query = first_token
 
-        if not row or row["id"] in seen_ids:
+        if not query:
             continue
-        seen_ids.add(row["id"])
-        resolved.append((row, path))
 
-    return resolved
+        cands = resolve_candidates(query, agent=ag, limit=5)
+        if cands:
+            best_score, best_row, best_path = cands[0]
+            if best_row["id"] in seen_ids:
+                continue
+            seen_ids.add(best_row["id"])
+            other_cands = [item[1] for item in cands[1:4]]
+            matches.append({
+                "agent": ag,
+                "raw_query": query,
+                "status": "matched",
+                "row": best_row,
+                "path": best_path,
+                "other_candidates": other_cands,
+                "total_matches": len(cands),
+            })
+        else:
+            recent = _get_agent_sessions(ag)[:3]
+            matches.append({
+                "agent": ag,
+                "raw_query": query,
+                "status": "not_found",
+                "row": None,
+                "path": None,
+                "other_candidates": [],
+                "total_matches": 0,
+                "recent_sessions": recent,
+            })
+
+    return matches
 
 
 def cmd_hook(args):
@@ -918,7 +966,8 @@ def cmd_hook(args):
 
     prompt_text = data.get("prompt") or data.get("user_prompt") or ""
     cwd = data.get("cwd") or os.getcwd()
-    if not prompt_text or "@" not in prompt_text:
+    TRIGGER_CHARS = ("@", "#", "引用", "同步", "接", "查")
+    if not prompt_text or not any(ch in prompt_text for ch in TRIGGER_CHARS):
         print("{}")
         return
 
@@ -929,12 +978,51 @@ def cmd_hook(args):
 
     blocks = [
         "<cross-session-context>",
-        "系统已自动为您识别并加载了用户通过 `@会话标题` 引用的完整历史会话上下文，请直接基于以下全量历史对话继续响应用户的请求（无需再次调用工具重复搜索该会话）：",
+        "系统已自动识别并同步了用户引用的跨会话上下文（支持 @codex/@claude 及自然语言引用）：",
         "",
     ]
-    for row, path in matches[:3]:
-        blocks.append(format_session_transcript(row, path, tail=None, max_chars=None, full=True))
-        blocks.append("---")
+    for item in matches[:3]:
+        ag = item["agent"]
+        ag_upper = ag.upper()
+        if item["status"] == "matched":
+            row = item["row"]
+            path = item["path"]
+            title = row.get("title") or "(无标题)"
+            upd = row.get("updated_at") or "?"
+            sid = row.get("id", "")[:8]
+
+            msg_count_str = ""
+            try:
+                _, msgs = load_messages(row, path, tail=None)
+                msg_count_str = f"，共 {len(msgs)} 条全量对话"
+            except Exception:
+                pass
+
+            blocks.append(f"### 💡 [Session-Bridge] 已自动同步并注入 {ag_upper} 会话: 《{title}》")
+            blocks.append(f"- 更新时间: {upd} | ID: {sid}...{msg_count_str}")
+
+            if item.get("other_candidates"):
+                c_lines = []
+                for idx, c in enumerate(item["other_candidates"], start=2):
+                    c_title = c.get("title") or "(无标题)"
+                    c_upd = (c.get("updated_at") or "-")[:16]
+                    c_lines.append(f"  * 候选 {idx}: 《{c_title}》({c_upd}) -> 精准引用语法: `@{ag}{c_title}`")
+                blocks.append(f"> ℹ️ **多结果提示**: 关键词 `{item['raw_query']}` 共匹配到 {item['total_matches']} 个会话，已优先注入最新的上述会话。其他候选：\n" + "\n".join(c_lines))
+
+            blocks.append("")
+            blocks.append(format_session_transcript(row, path, tail=None, max_chars=None, full=True))
+            blocks.append("---")
+        else:
+            recent_lines = []
+            for idx, r in enumerate(item.get("recent_sessions", []), start=1):
+                r_title = r.get("title") or "(无标题)"
+                r_upd = (r.get("updated_at") or "-")[:16]
+                recent_lines.append(f"  {idx}. 《{r_title}》({r_upd}) -> 语法: `@{ag}{r_title}`")
+            blocks.append(f"### ⚠️ [Session-Bridge] 未找到匹配关键词 “{item['raw_query']}” 的 {ag_upper} 历史会话")
+            blocks.append(f"用户尝试引用 {ag_upper} 会话，但未找到精确匹配记录。系统最近的 {ag_upper} 会话有：\n" + "\n".join(recent_lines))
+            blocks.append("（请向用户友好说明未检索到该会话，并提供上述最近会话供用户确认）")
+            blocks.append("---")
+
     blocks.append("</cross-session-context>")
 
     output = {
@@ -1042,7 +1130,7 @@ def cmd_suggest(args):
             query = ""
 
     q = (query or "").strip()
-    if q.startswith("@"):
+    if q.startswith("@") or q.startswith("#"):
         q = q[1:].strip()
 
     other_agent = "codex" if args.current_agent == "claude" else "claude"
@@ -1087,9 +1175,51 @@ def cmd_suggest(args):
         print(item)
 
 
+def cmd_list(args):
+    """毫秒级模糊查询历史会话标题与快捷引用语法，方便快速查阅与复制引用。"""
+    agent = getattr(args, "agent", "all") or "all"
+    query = (getattr(args, "query", "") or "").strip()
+    limit = getattr(args, "limit", 25) or 25
+
+    rows = all_sessions(agent)
+    if query:
+        q_lower = query.lower()
+        scored = []
+        for r in rows:
+            sc = score_candidate(r, q_lower)
+            if sc > 0:
+                scored.append((sc, r.get("updated_ts", 0.0), r))
+        scored.sort(key=lambda x: (x[0], x[1]), reverse=True)
+        items = [x[2] for x in scored[:limit]]
+    else:
+        items = rows[:limit]
+
+    print(f"\n找到 {len(items)} 个历史会话 (Agent: {agent}, 关键词: '{query or '全部'}'):\n")
+    header = f"{'Agent':<7} | {'更新时间':<16} | {'快捷引用语法':<32} | 会话标题"
+    print(header)
+    print("-" * 96)
+    for r in items:
+        ag = r.get("agent", "all")
+        upd = (r.get("updated_at") or "-")[:16]
+        title = r.get("title") or "(无标题)"
+        clean_title = title.split("\n")[0].strip()
+        ref = f"@{ag}{clean_title}"
+        if len(ref) > 30:
+            ref = ref[:29] + "…"
+        print(f"{ag:<7} | {upd:<16} | {ref:<32} | {title}")
+
+    print("\n💡 提示: 复制上表的「快捷引用语法」（如 @claude标题 或 @codex标题）在客户端直接发送，即可无损注入全量历史。\n")
+
+
 def main():
     ap = argparse.ArgumentParser(description="Claude ⇄ Codex 会话互读/接力（全量无损版）")
     sub = ap.add_subparsers(dest="cmd", required=True)
+
+    ls = sub.add_parser("list", aliases=["ls"], help="毫秒级模糊查询历史会话标题与快捷引用语法")
+    ls.add_argument("query", nargs="?", default="", help="搜索关键词（支持模糊子序列与拼音/中英文）")
+    ls.add_argument("--agent", default="all", choices=["codex", "claude", "all"], help="筛选 Agent")
+    ls.add_argument("--limit", type=int, default=25, help="最多显示的条数")
+    ls.set_defaults(func=cmd_list)
 
     s = sub.add_parser("search", help="搜会话（默认全量检索所有历史会话）")
     s.add_argument("keyword", nargs="?", default="")

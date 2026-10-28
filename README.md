@@ -9,16 +9,25 @@
 ## 核心特性
 
 1. **`@codex 会话标题` / `@claude 会话标题` 毫秒级自动注入（`UserPromptSubmit` Hook）**
-   - **在 Claude 中引用 Codex 会话**：`@codex 订单结算重构 接着刚才的做`（也支持 `@codex:订单结算重构` 或 `@codex「订单结算 AI 测试」`）
-   - **在 Codex 中引用 Claude 会话**：`@claude 登录鉴权排查 继续刚才的分析`（也支持 `@claude:登录鉴权排查` 或 `@claude「登录鉴权 AI 排查」`）
+   - **人性化语法全兼容**：
+     - 直接连写（推荐）：`@claude店发测试 帮我分析` / `@codex订单结算 接着写`（智能最长前缀匹配会话标题与首词分词，后面跟指令无需多余符号）
+     - 中英文冒号/空格/引号：`@claude：店发测试` / `@codex:订单结算` / `@claude 店发测试` / `@codex"订单结算"`
+     - 客户端 Markdown 链接兼容：`[@codex 店发测试](thread://...)`（拖拽或客户端原生补全插入均可识别）
+     - 自然语言引用：`引用codex:订单结算` / `同步claude店发测试`
    - **零冲突设计**：普通的裸 `@xxx` 完全交给客户端原生处理（如 Codex 自带的 `@` 会话/文件选择、Claude 自带的 `@` 文件选择），只有带 `@codex` 或 `@claude` 前缀时才触发跨端会话桥接。
-   - 发送瞬间自动匹配对应历史会话，通过 SQLite 主键索引毫秒级提取**从第 `#1` 条到最后一条的完整对话**，并以 `<cross-session-context>` 标签自动注入。
+   - **视觉透明与智能反馈横幅**：
+     - **精准命中**：毫秒级提取**从第 `#1` 条到最后一条的完整真实对话**，附带标题、ID、更新时间和有效消息统计。
+     - **多项匹配**：优先自动注入最新的一条会话，并以优雅横幅列出其他候选会话的更新时间与精准引用语法（如 `@claude完整标题`）。
+     - **0 命中友好提示**：若未搜到关键词，列出目标 Agent 最近的 3 个活跃会话及对应语法，方便向用户确认。
 
-2. **客户端 `@` 补全菜单与主动检索（`session-bridge` MCP Server）**
+2. **极速命令行速查（`list` / `ls` 表格视图）**
+   - 终端输入 `python session_bridge.py list [关键词]`（或 `ls`），<0.02s 极速展示所有历史会话表格，列出 Agent、更新时间、快捷引用语法与会话标题，一键复制即可直接使用。
+
+3. **客户端 `@` 补全菜单与主动检索（`session-bridge` MCP Server）**
    - **MCP Resources**：自动暴露本机所有有正文的 Codex 与 Claude 历史会话（`codex <标题>` / `claude <标题>`），支持在客户端 `@` 菜单中输入 `@codex` 或 `@claude` 过滤点选。
    - **MCP Tools**：提供 `read_session`（支持全量读取、`start`/`end` 序号区间过滤、`grep` 会话内关键词检索）与 `search_sessions`（全量扫描本机所有历史会话）。
 
-3. **跨平台零硬编码路径**
+4. **跨平台零硬编码路径**
    - 自动发现 `~/.codex`（或 `$CODEX_HOME`）下的最新 `state_*.sqlite`、`thread_history_*.sqlite` 与 `sessions/`。
    - 自动发现 `~/.claude`、`$CLAUDE_CONFIG_DIR` 以及 `~/.claude/settings.json` 中配置的自定义 `claudeConfigDir`。
 
@@ -58,26 +67,30 @@ python ~/.claude/skills/codex-sessions/install.py
 
 | 当前工具 | 输入示例 | 效果 |
 |---|---|---|
-| **Claude Code** | `@codex 订单结算重构 接着刚才的逻辑往下写` | 自动加载 Codex 中《订单结算重构》会话的全量历史对话并继续 |
-| **Codex** | `@claude 登录鉴权排查 按刚才讨论的方案改代码` | 自动加载 Claude 中《登录鉴权排查》会话的全量历史对话并继续 |
-| **任意一端** | `@codex:标题` / `@claude:标题` / `@codex「含空格标题」` | 冒号分隔或括号包裹含空格标题同样支持 |
+| **Claude Code / 桌面端** | `@codex店发测试 接着刚才的逻辑往下写` | 自动加载 Codex 中《店发测试》会话的全量历史对话并继续 |
+| **Codex CLI / 桌面端** | `@claude登录鉴权 按刚才讨论的方案改代码` | 自动加载 Claude 中《登录鉴权》会话的全量历史对话并继续 |
+| **任意一端（各种符号兼容）** | `@codex:标题` / `@claude：标题` / `@codex 标题` / `[@codex 标题](thread://...)` | 英文冒号/中文冒号/空格/引号/Markdown 链接均自动识别 |
 
 ### 2. 命令行直接使用 `session_bridge.py`
 
 ```bash
 SB="$HOME/.claude/skills/codex-sessions/session_bridge.py"
 
-# 搜索本机所有 Codex + Claude 会话
+# 1. 表格化速查历史会话与快捷引用语法（支持模糊匹配）
+python "$SB" list "关键词"
+python "$SB" ls
+
+# 2. 搜索本机所有 Codex + Claude 会话
 python "$SB" search "关键词" --agent all
 
-# 读取指定会话从 #1 到最后一条的完整对话
+# 3. 读取指定会话从 #1 到最后一条的完整对话
 python "$SB" read "会话标题或ID前缀" --full
 
-# 按消息序号区间或会话内关键词读取
+# 4. 按消息序号区间或会话内关键词读取
 python "$SB" read "会话标题或ID前缀" --start 1 --end 50
 python "$SB" read "会话标题或ID前缀" --grep "关键词"
 
-# 导出完整 Markdown 交接包
+# 5. 导出完整 Markdown 交接包
 python "$SB" handoff "会话标题或ID前缀" --to codex
 ```
 
